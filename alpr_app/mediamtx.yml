@@ -1,0 +1,4 @@
+paths:
+  cam:
+    source: rtsp://admin:Soft0508@10.0.0.164:554/onvif1
+    rtspTransport: tcp
