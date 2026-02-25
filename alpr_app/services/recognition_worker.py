@@ -52,7 +52,6 @@ def is_valid_plate_format(text):
     cleaned_text = normalizar_placa(text)
     
     # Procura um bloco de 7 caracteres contínuos no meio da sujeira do OCR
-    # Ex: se ele ler "R102A197", vai extrair apenas "R102A19"
     match = re.search(r'([A-Z0-9]{7})', cleaned_text)
     
     if match:
@@ -62,14 +61,12 @@ def is_valid_plate_format(text):
         corrigido = list(plate_candidate)
         
         # 1. As 3 primeiras posições no Brasil SEMPRE são letras.
-        # Corrige números lidos no lugar errado (Ex: 0 -> O, 1 -> I)
         subs_letras = {'0': 'O', '1': 'I', '5': 'S', '8': 'B'}
         for i in range(3):
             if corrigido[i] in subs_letras:
                 corrigido[i] = subs_letras[corrigido[i]]
                 
         # 2. As posições 3, 5 e 6 SEMPRE são números (Mercosul ou Antiga).
-        # Corrige letras lidas no lugar errado (Ex: O -> 0, I -> 1)
         subs_numeros = {'O': '0', 'I': '1', 'S': '5', 'B': '8', 'G': '6', 'Z': '2', 'A': '4'}
         for i in [3, 5, 6]:
             if corrigido[i] in subs_numeros:
@@ -81,7 +78,6 @@ def is_valid_plate_format(text):
     return False, None
 
 def find_plate_candidates_advanced(vehicle_img):
-    """Aplica filtros para evidenciar a placa antes do OCR"""
     gray = cv2.cvtColor(vehicle_img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 50, 200)
@@ -92,19 +88,18 @@ def find_plate_candidates_advanced(vehicle_img):
         aspect_ratio = w / float(h)
         if 2.0 < aspect_ratio < 4.5 and w > 60 and h > 15:
             return vehicle_img[y:y+h, x:x+w]
-    return vehicle_img # Retorna original se não achar um contorno exato
+    return vehicle_img
 
 class RecognitionWorker:
     def __init__(self) -> None:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self.placas_recentes = {} # Para evitar flood da mesma placa
+        self.placas_recentes = {} 
         self.net = None
         self.reader = None
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
+        if self._thread and self._thread.is_alive(): return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -150,7 +145,6 @@ class RecognitionWorker:
         return None, 0.0
 
     def _registrar_evento(self, plate_text, prob, config, channel_layer):
-        """Salva no banco e avisa o front-end via WebSocket"""
         match_servidor, match_score = self._buscar_autorizado(plate_text, config.tolerancia_match_percentual)
 
         evento = EventoLeitura.objects.create(
@@ -177,7 +171,6 @@ class RecognitionWorker:
         )
 
     def _enviar_log_ws(self, mensagem: str, channel_layer):
-        """Envia um log de texto simples para a tela frontal"""
         async_to_sync(channel_layer.group_send)(
             "placas_status",
             {
@@ -198,8 +191,7 @@ class RecognitionWorker:
         print("[INFO] Carregando Rede Neural MobileNet...")
         self.net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
         
-        print("[INFO] Inicializando EasyOCR (Isso pode demorar alguns segundos na primeira vez)...")
-        # GPU False porque nem sempre temos CUDA disponível no ambiente de dev
+        print("[INFO] Inicializando EasyOCR...")
         self.reader = easyocr.Reader(['pt'], gpu=False) 
 
         raw_source = str(config.rtsp_url).strip()
@@ -212,76 +204,87 @@ class RecognitionWorker:
             if cap is None:
                 time.sleep(2)
                 continue
+                
+            # Força o OpenCV a ignorar buffer interno (útil para RTSP/USB)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             print("[INFO] ✓ Câmera conectada. Iniciando Detecção de Placas!")
-            while not self._stop_event.is_set():
-                ok, frame = cap.read()
-                if not ok or frame is None: break
-                
-                # Descomente a linha abaixo se no futuro quiser forçar o giro da imagem
-                # frame = cv2.rotate(frame, cv2.ROTATE_180)
+            
+            # --- O "OLHO": THREAD DE CAPTURA RÁPIDA ---
+            # Essa thread só faz uma coisa: pegar a foto mais recente e atualizar a tela.
+            # Não pensa, não trava, só trabalha.
+            self.capture_active = True
+            def grabber_thread_func():
+                global last_frame
+                while self.capture_active and not self._stop_event.is_set():
+                    ok, frame = cap.read()
+                    if not ok: break
+                    last_frame = frame.copy()
 
-                last_frame = frame.copy()
+            grabber_thread = threading.Thread(target=grabber_thread_func, daemon=True)
+            grabber_thread.start()
+
+            # --- O "CÉREBRO": LOOP DE IA (OCR e MobileNet) ---
+            while not self._stop_event.is_set() and grabber_thread.is_alive():
+                if last_frame is None:
+                    time.sleep(0.01)
+                    continue
+                
+                # O cérebro copia a foto exata do momento e vai trabalhar
+                frame_atual = last_frame.copy()
                 frame_skip_counter += 1
 
-                # Processa 1 frame a cada 5 para manter o vídeo fluido
                 if frame_skip_counter % 5 != 0:
                     time.sleep(0.01)
                     continue
 
-                # 1. Preparar imagem para Detecção de Veículo (MobileNet)
-                h, w = frame.shape[:2]
+                h, w = frame_atual.shape[:2]
                 if w == 0 or h == 0: continue
                 r = 800.0 / float(w)
-                frame_resized = cv2.resize(frame, (800, int(h * r)), interpolation=cv2.INTER_AREA)
+                frame_resized = cv2.resize(frame_atual, (800, int(h * r)), interpolation=cv2.INTER_AREA)
                 (h_res, w_res) = frame_resized.shape[:2]
 
                 blob = cv2.dnn.blobFromImage(frame_resized, 0.007843, (300, 300), 127.5)
                 self.net.setInput(blob)
                 detections = self.net.forward()
 
-                # Limpa cooldown de placas antigas (10 segundos para não ler a mesma placa 50 vezes)
                 agora = datetime.now()
                 self.placas_recentes = {p: t for p, t in self.placas_recentes.items() if (agora - t) <= timedelta(seconds=10)}
 
-                # 2. Varredura de veículos detectados
                 for i in range(detections.shape[2]):
                     confidence = detections[0, 0, i, 2]
                     idx = int(detections[0, 0, i, 1])
 
-                    # Se achou carro, onibus ou moto com +50% de certeza
                     if confidence > 0.5 and CLASSES[idx] in ["car", "bus", "motorbike"]:
                         box = detections[0, 0, i, 3:7] * np.array([w_res, h_res, w_res, h_res])
                         (startX, startY, endX, endY) = box.astype("int")
                         
-                        # Limites de segurança da matriz
                         startX, startY = max(0, startX), max(0, startY)
                         endX, endY = min(w_res, endX), min(h_res, endY)
                         
                         vehicle_img = frame_resized[startY:endY, startX:endX]
                         if vehicle_img.size == 0: continue
 
-                        # 👇 Avisa que o OCR vai começar
                         self._enviar_log_ws("Veículo detectado! Processando OCR...", channel_layer)
 
                         image_to_ocr = find_plate_candidates_advanced(vehicle_img)
                         ocr_results = self.reader.readtext(image_to_ocr, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
                         
                         for (bbox, text, prob) in ocr_results:
-                            # 👇 Manda pro front tudo que o OCR enxergar
-                            self._enviar_log_ws(f"Texto lido: '{text}' (Conf: {prob:.0%})", channel_layer)
+                            if len(text) >= 4:
+                                self._enviar_log_ws(f"Texto lido: '{text}' (Conf: {prob:.0%})", channel_layer)
                             
-                            if prob > 0.4: # Confiança mínima do texto
+                            if prob > 0.3: # Reduzi a confiança pra ajudar o corretor inteligente
                                 is_valid, plate_text = is_valid_plate_format(text)
                                 
                                 if is_valid and plate_text not in self.placas_recentes:
-                                    print(f"[SUCESSO] Placa {plate_text} detectada! Confiança: {prob:.2%}")
+                                    print(f"[SUCESSO] Placa validada: {plate_text}")
                                     self.placas_recentes[plate_text] = agora
-                                    # Manda pro banco e pro Histórico Oficial do WebSocket
                                     self._registrar_evento(plate_text, prob, config, channel_layer)
 
-                time.sleep(0.01)
-
+            # Se saiu do loop, a câmera caiu. Para o "Olho" e reconecta.
+            self.capture_active = False
+            grabber_thread.join()
             if cap: cap.release()
 
 worker = RecognitionWorker()
